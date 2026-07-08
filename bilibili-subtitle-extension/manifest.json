@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "Bilibili Subtitle Extractor",
+  "version": "0.1.2",
+  "description": "Extract existing Bilibili subtitles and AI subtitles as TXT, SRT, or JSON.",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://www.bilibili.com/*",
+    "https://api.bilibili.com/*",
+    "https://aisubtitle.hdslb.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Extract Bilibili subtitles"
+  }
+}

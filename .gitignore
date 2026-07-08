@@ -1,0 +1,20 @@
+# Local secrets
+cookie.txt
+*.cookie
+
+# Chrome extension packaging outputs
+*.crx
+*.pem
+
+# Extracted subtitle outputs
+output/
+
+# Python/runtime cache
+__pycache__/
+*.py[cod]
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

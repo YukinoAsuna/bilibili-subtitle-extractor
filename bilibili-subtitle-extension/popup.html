@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Bilibili Subtitle Extractor</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Bilibili Subtitle Extractor</h1>
+        <p id="status">Open a Bilibili video page, then extract subtitles.</p>
+      </header>
+
+      <section id="result" hidden>
+        <div class="meta">
+          <strong id="title"></strong>
+          <span id="count"></span>
+          <code id="debug"></code>
+          <p id="preview"></p>
+        </div>
+        <div class="buttons">
+          <button id="downloadTxt" type="button">TXT</button>
+          <button id="downloadSrt" type="button">SRT</button>
+          <button id="downloadJson" type="button">JSON</button>
+        </div>
+      </section>
+
+      <button id="extract" class="primary" type="button">Extract current page</button>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
