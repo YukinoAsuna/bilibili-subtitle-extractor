@@ -1,21 +1,32 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Bilibili Subtitle Extractor</title>
+    <title>视频字幕抽取</title>
     <link rel="stylesheet" href="popup.css">
   </head>
   <body>
     <main>
       <header>
-        <h1>Bilibili Subtitle Extractor</h1>
-        <p id="status">Open a Bilibili video page, then extract subtitles.</p>
+        <h1>视频字幕抽取</h1>
+        <p id="status">打开 B站或 YouTube 视频页面，然后读取字幕。</p>
       </header>
+
+      <section id="youtubeOptions" class="options" hidden>
+        <label for="sourceTrack">字幕来源</label>
+        <select id="sourceTrack"></select>
+
+        <label for="targetLanguage">翻译</label>
+        <select id="targetLanguage"></select>
+
+        <button id="loadTrack" class="primary" type="button">抽取所选字幕</button>
+      </section>
 
       <section id="result" hidden>
         <div class="meta">
           <strong id="title"></strong>
+          <span id="language"></span>
           <span id="count"></span>
           <code id="debug"></code>
           <p id="preview"></p>
@@ -27,7 +38,7 @@
         </div>
       </section>
 
-      <button id="extract" class="primary" type="button">Extract current page</button>
+      <button id="extract" class="primary" type="button">读取当前页面</button>
     </main>
     <script src="popup.js"></script>
   </body>
