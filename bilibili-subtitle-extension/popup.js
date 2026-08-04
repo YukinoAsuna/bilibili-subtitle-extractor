@@ -69,10 +69,21 @@ function downloadText(filename, content, mimeType) {
 async function fetchJson(url) {
   const response = await fetch(url, {
     credentials: "include",
-    headers: { accept: "application/json, text/plain, */*" }
+    cache: "no-store",
+    headers: {
+      accept: "application/json, text/plain, */*",
+      "cache-control": "no-cache",
+      pragma: "no-cache"
+    }
   });
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${url}`);
-  return response.json();
+  const text = await response.text();
+  if (!text.trim()) throw new Error(`服务器返回了空内容：${url}`);
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    throw new Error(`服务器返回的内容不是有效 JSON：${url}`);
+  }
 }
 
 async function getActiveTab() {
@@ -96,44 +107,103 @@ function getBvidFromUrl(url) {
   return String(url || "").match(/BV[0-9A-Za-z]+/)?.[0] || "";
 }
 
-async function getBilibiliVideoInfo(bvid) {
-  const view = await fetchJson(`https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`);
+async function getBilibiliVideoInfo(bvid, pageUrl) {
+  const view = await fetchJson(`https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(bvid)}&_=${Date.now()}`);
   if (view.code !== 0) throw new Error(view.message || "获取 B站视频信息失败。");
 
   const aid = String(view.data?.aid || "");
-  const cid = String(view.data?.pages?.[0]?.cid || view.data?.cid || "");
+  const requestedPage = Math.max(1, Number(new URL(pageUrl).searchParams.get("p")) || 1);
+  const selectedPage = view.data?.pages?.[requestedPage - 1] || view.data?.pages?.[0];
+  const cid = String(selectedPage?.cid || view.data?.cid || "");
   const title = view.data?.title || bvid;
   if (!aid || !cid) throw new Error("没有获取到当前视频的 aid/cid。");
   return { bvid, aid, cid, title };
 }
 
-async function collectLoadedBilibiliSubtitleUrls(tabId) {
-  const [injection] = await chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => [...new Set(
-      performance.getEntriesByType("resource")
-        .map((entry) => entry.name)
-        .filter((url) => url.includes("aisubtitle.hdslb.com/bfs/ai_subtitle/"))
-    )].reverse()
-  });
-  return injection?.result || [];
+function normalizeBilibiliSubtitleUrl(value) {
+  if (!value) return "";
+  return value.startsWith("//") ? `https:${value}` : value;
 }
 
-function pickMatchingBilibiliUrls(urls, video) {
-  const fullKey = `${video.aid}${video.cid}`;
-  const strictMatches = urls.filter((url) => url.includes(fullKey));
-  return strictMatches.length ? strictMatches : urls.filter((url) => url.includes(video.cid));
+async function getFreshBilibiliSubtitleUrls(tabId, video) {
+  const baseUrl = `https://api.bilibili.com/x/player/wbi/v2?bvid=${encodeURIComponent(video.bvid)}&cid=${encodeURIComponent(video.cid)}`;
+  const parsePlayer = (player) => {
+    if (player.code !== 0) {
+      return { urls: [], needLogin: false, error: player.message || `接口错误 ${player.code}` };
+    }
+
+    const responseAid = String(player.data?.aid || "");
+    const responseBvid = String(player.data?.bvid || "");
+    const responseCid = String(player.data?.cid || "");
+    if (
+      (responseAid && responseAid !== video.aid) ||
+      (responseBvid && responseBvid !== video.bvid) ||
+      (responseCid && responseCid !== video.cid)
+    ) {
+      return {
+        urls: [],
+        needLogin: false,
+        error: "B站接口返回的 aid/bvid/cid 与当前视频不一致，已拒绝使用该字幕"
+      };
+    }
+
+    return {
+      urls: (player.data?.subtitle?.subtitles || [])
+        .map((subtitle) => normalizeBilibiliSubtitleUrl(subtitle.subtitle_url || subtitle.ai_subtitle_url))
+        .filter(Boolean),
+      needLogin: Boolean(player.data?.need_login_subtitle),
+      error: ""
+    };
+  };
+
+  let pageResult = null;
+  try {
+    const pageUrl = `${baseUrl}&_=${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const result = await fetchTextFromVideoPage(tabId, pageUrl);
+    if (!result?.ok || !result.text?.trim()) {
+      throw new Error(result?.networkError || `HTTP ${result?.status || 0}`);
+    }
+    pageResult = parsePlayer(JSON.parse(result.text));
+    if (pageResult.urls.length) return pageResult;
+    if (!pageResult.urls.length && !pageResult.needLogin && !pageResult.error) return pageResult;
+  } catch (error) {
+    pageResult = { urls: [], needLogin: false, error: error.message || String(error) };
+  }
+
+  try {
+    const directResult = parsePlayer(await fetchJson(`${baseUrl}&_=${Date.now()}-${Math.random().toString(36).slice(2)}`));
+    if (directResult.urls.length || !directResult.needLogin) return directResult;
+    return pageResult?.urls.length ? pageResult : directResult;
+  } catch (error) {
+    if (pageResult?.urls.length || pageResult?.needLogin) return pageResult;
+    return { urls: [], needLogin: false, error: error.message || pageResult?.error || "播放器字幕接口无法解析" };
+  }
 }
 
-async function loadBilibiliSubtitleFromUrls(urls) {
+async function loadBilibiliSubtitleFromUrls(urls, tabId) {
   const errors = [];
   for (const url of urls) {
+    let directError = "";
     try {
       const subtitleJson = await fetchJson(url);
       if (subtitleJson?.body?.length) return { subtitleJson, subtitleUrl: url };
+      directError = "扩展请求返回的 JSON 中没有 body";
+    } catch (error) {
+      const message = error.message || String(error);
+      directError = message.match(/HTTP \d+/)?.[0] || message.slice(0, 80);
+    }
+
+    try {
+      const result = await fetchTextFromVideoPage(tabId, url);
+      if (!result) throw new Error("没有读取到字幕响应");
+      if (!result.ok) throw new Error(result.networkError || `HTTP ${result.status}`);
+      if (!result.text?.trim()) throw new Error("字幕响应为空");
+      const subtitleJson = JSON.parse(result.text);
+      if (subtitleJson?.body?.length) return { subtitleJson, subtitleUrl: url };
       errors.push("JSON 中没有 body");
     } catch (error) {
-      errors.push(error.message || String(error));
+      const pageError = error.message || String(error);
+      errors.push(`扩展请求：${directError}；页面请求：${pageError}`);
     }
   }
   throw new Error(`匹配到字幕地址，但读取失败：${errors[0] || "未知错误"}`);
@@ -143,20 +213,50 @@ async function extractBilibili(tab) {
   const bvid = getBvidFromUrl(tab.url);
   if (!bvid) throw new Error("当前地址中没有找到 BV 号。");
 
-  const video = await getBilibiliVideoInfo(bvid);
-  const loadedUrls = await collectLoadedBilibiliSubtitleUrls(tab.id);
-  const matchingUrls = pickMatchingBilibiliUrls(loadedUrls, video);
-  if (!matchingUrls.length) {
+  const video = await getBilibiliVideoInfo(bvid, tab.url);
+  const apiResult = await getFreshBilibiliSubtitleUrls(tab.id, video);
+  const candidateUrls = [...new Set(apiResult.urls)]
+    .map(normalizeBilibiliSubtitleUrl)
+    .filter(Boolean);
+  if (!candidateUrls.length) {
+    if (apiResult.needLogin) {
+      throw new Error("这个视频的字幕需要登录。请确认当前 B站页面已登录，刷新页面并重新打开字幕后再试。");
+    }
+    if (apiResult.error) {
+      throw new Error(`没有取得新的字幕地址：${apiResult.error}。请刷新 B站视频页面后重试。`);
+    }
     throw new Error("没有发现当前视频已加载的字幕。请打开字幕并播放几秒，然后重试。");
   }
 
-  const { subtitleJson, subtitleUrl } = await loadBilibiliSubtitleFromUrls(matchingUrls);
+  let loadedSubtitle;
+  try {
+    loadedSubtitle = await loadBilibiliSubtitleFromUrls(candidateUrls, tab.id);
+  } catch (error) {
+    if (!String(error?.message || error).includes("HTTP 403")) throw error;
+
+    const retryResult = await getFreshBilibiliSubtitleUrls(tab.id, video);
+    const retryUrls = [...new Set(retryResult.urls)]
+      .map(normalizeBilibiliSubtitleUrl)
+      .filter(Boolean);
+    if (!retryUrls.length) throw error;
+
+    try {
+      loadedSubtitle = await loadBilibiliSubtitleFromUrls(retryUrls, tab.id);
+    } catch (retryError) {
+      if (String(retryError?.message || retryError).includes("HTTP 403")) {
+        throw new Error("B站字幕资源实际返回了 HTTP 403；插件已重新请求当前视频字幕地址并重试，但签名仍被服务器拒绝。");
+      }
+      throw retryError;
+    }
+  }
+
+  const { subtitleJson, subtitleUrl } = loadedSubtitle;
   return {
     site: "bilibili",
     id: bvid,
     title: video.title,
     language: "B站字幕",
-    source: "loaded-aisubtitle-url",
+    source: "current-player-wbi-api",
     subtitleUrl,
     body: subtitleJson.body,
     originalJson: subtitleJson
@@ -215,7 +315,118 @@ async function getYouTubeContext(tab) {
   if (!context?.tracks?.length) {
     throw new Error("没有发现 YouTube 字幕轨道。请刷新页面，确认播放器中能打开 CC，然后重试。");
   }
-  return context;
+  return { ...context, tabId: tab.id };
+}
+
+async function fetchTextInVideoPage(url) {
+  try {
+    const response = await fetch(url, {
+      credentials: "include",
+      cache: "no-store",
+      headers: { "cache-control": "no-cache", pragma: "no-cache" }
+    });
+    return {
+      ok: response.ok,
+      status: response.status,
+      contentType: response.headers.get("content-type") || "",
+      text: await response.text()
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      contentType: "",
+      text: "",
+      networkError: error?.message || String(error)
+    };
+  }
+}
+
+async function fetchTextFromVideoPage(tabId, url) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: fetchTextInVideoPage,
+    args: [url]
+  });
+  return injection?.result || null;
+}
+
+function collectLoadedYouTubeSubtitleUrlsInPage() {
+  return [...new Set(
+    performance.getEntriesByType("resource")
+      .map((entry) => entry.name)
+      .filter((url) => url.includes("/api/timedtext"))
+  )].reverse();
+}
+
+async function getLoadedYouTubeSubtitleUrls(tabId) {
+  const [injection] = await chrome.scripting.executeScript({
+    target: { tabId },
+    world: "MAIN",
+    func: collectLoadedYouTubeSubtitleUrlsInPage
+  });
+  return injection?.result || [];
+}
+
+function pickLoadedYouTubeTrackUrls(urls, track, videoId) {
+  return urls.filter((value) => {
+    try {
+      const url = new URL(value);
+      const language = url.searchParams.get("lang");
+      const kind = url.searchParams.get("kind") || "manual";
+      const candidateVideoId = url.searchParams.get("v");
+      if (candidateVideoId && videoId && candidateVideoId !== videoId) return false;
+      if (language !== track.languageCode) return false;
+      if (track.kind === "asr") return kind === "asr";
+      return kind !== "asr";
+    } catch (_) {
+      return false;
+    }
+  });
+}
+
+function buildYouTubeSubtitleUrls(baseUrls, targetCode) {
+  const results = [];
+  for (const value of baseUrls) {
+    try {
+      const url = new URL(value);
+      url.searchParams.set("fmt", "json3");
+      if (targetCode) url.searchParams.set("tlang", targetCode);
+      else url.searchParams.delete("tlang");
+      if (!results.includes(url.href)) results.push(url.href);
+    } catch (_) {
+      // Ignore malformed resource entries and keep trying the remaining URLs.
+    }
+  }
+  return results;
+}
+
+async function fetchYouTubeSubtitleJson(tabId, urls) {
+  const errors = [];
+  for (const url of urls) {
+    const result = await fetchTextFromVideoPage(tabId, url);
+    if (!result) {
+      errors.push("没有读取到字幕响应");
+      continue;
+    }
+    if (!result.ok) {
+      errors.push(result.networkError || `HTTP ${result.status}`);
+      continue;
+    }
+    if (!result.text?.trim()) {
+      errors.push("空字幕响应");
+      continue;
+    }
+    try {
+      return { subtitleJson: JSON.parse(result.text), subtitleUrl: url };
+    } catch (_) {
+      errors.push(`无法解析 ${result.contentType || "未知内容类型"}`);
+    }
+  }
+
+  const detail = errors.filter(Boolean).slice(0, 3).join("；") || "没有可用字幕地址";
+  throw new Error(`YouTube 字幕读取失败：${detail}。请确认播放器已显示所选字幕后重新读取。`);
 }
 
 function populateYouTubeOptions(context) {
@@ -284,12 +495,12 @@ async function extractSelectedYouTubeTrack() {
   const targetCode = targetLanguageEl.value;
   if (targetCode && !track.isTranslatable) throw new Error("这个字幕轨道不支持 YouTube 自动翻译。");
 
-  const subtitleUrl = new URL(track.baseUrl);
-  subtitleUrl.searchParams.set("fmt", "json3");
-  if (targetCode) subtitleUrl.searchParams.set("tlang", targetCode);
-  else subtitleUrl.searchParams.delete("tlang");
+  const loadedUrls = await getLoadedYouTubeSubtitleUrls(youtubeContext.tabId);
+  const matchingLoadedUrls = pickLoadedYouTubeTrackUrls(loadedUrls, track, youtubeContext.videoId);
+  const candidateUrls = buildYouTubeSubtitleUrls([...matchingLoadedUrls, track.baseUrl], targetCode);
+  if (!candidateUrls.length) throw new Error("没有找到可用的 YouTube 字幕请求地址。");
 
-  const subtitleJson = await fetchJson(subtitleUrl.href);
+  const { subtitleJson, subtitleUrl } = await fetchYouTubeSubtitleJson(youtubeContext.tabId, candidateUrls);
   const body = youtubeJson3ToBody(subtitleJson);
   if (!body.length) throw new Error("YouTube 返回了空字幕。请刷新视频页面后重新读取。");
 
@@ -306,7 +517,7 @@ async function extractSelectedYouTubeTrack() {
     source: track.kind === "asr" ? "youtube-auto-caption" : "youtube-caption",
     sourceLanguage: track.languageCode,
     targetLanguage: targetCode || null,
-    subtitleUrl: subtitleUrl.href,
+    subtitleUrl,
     body,
     originalJson: subtitleJson
   };

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Bilibili & YouTube Subtitle Extractor",
-  "version": "0.2.0",
+  "version": "0.2.8",
   "description": "Extract existing Bilibili and YouTube subtitles as TXT, SRT, or JSON.",
   "permissions": [
     "activeTab",
